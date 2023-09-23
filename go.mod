@@ -1,4 +1,4 @@
-module github.com/teekennedy/goldmark-markdown
+module github.com/persuader72/goldmark-markdown
 
 go 1.18
 
