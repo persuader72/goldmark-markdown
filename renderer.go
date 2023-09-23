@@ -3,10 +3,11 @@ package markdown
 
 import (
 	"bytes"
-	"fmt"
 	"io"
+	"strings"
 
 	"github.com/yuin/goldmark/ast"
+	exast "github.com/yuin/goldmark/extension/ast"
 	"github.com/yuin/goldmark/renderer"
 	"github.com/yuin/goldmark/text"
 )
@@ -25,8 +26,13 @@ func NewRenderer(options ...Option) *Renderer {
 
 // Renderer is an implementation of renderer.Renderer that renders nodes as Markdown
 type Renderer struct {
-	config *Config
-	rc     renderContext
+	config        *Config
+	rc            renderContext
+	isInsideTable bool
+	isHeaderDone  bool
+	columnSize    []int
+	tableHeaders  []string
+	tableCells    [][]string
 }
 
 // AddOptions implements renderer.Renderer.AddOptions
@@ -57,10 +63,12 @@ type nodeRenderer func(ast.Node, bool) ast.WalkStatus
 
 func (r *Renderer) getRenderer(node ast.Node) nodeRenderer {
 	renderers := []nodeRenderer{}
+
 	switch node.Type() {
 	case ast.TypeBlock:
 		renderers = append(renderers, r.renderBlockSeparator)
 	}
+
 	switch node.Kind() {
 	case ast.KindAutoLink:
 		renderers = append(renderers, r.renderAutoLink)
@@ -92,7 +100,16 @@ func (r *Renderer) getRenderer(node ast.Node) nodeRenderer {
 		renderers = append(renderers, r.renderText)
 	case ast.KindLink:
 		renderers = append(renderers, r.renderLink)
+	case exast.KindTable:
+		renderers = append(renderers, r.renderTable)
+	case exast.KindTableHeader:
+		renderers = append(renderers, r.renderTableHeader)
+	case exast.KindTableRow:
+		renderers = append(renderers, r.renderTableRow)
+	case exast.KindTableCell:
+		renderers = append(renderers, r.renderTableCell)
 	}
+
 	return r.chainRenderers(renderers...)
 }
 
@@ -251,26 +268,14 @@ func (r *Renderer) renderHTMLBlock(node ast.Node, entering bool) ast.WalkStatus 
 func (r *Renderer) renderList(node ast.Node, entering bool) ast.WalkStatus {
 	if entering {
 		n := node.(*ast.List)
-		r.rc.lists = append(r.rc.lists, listContext{
-			list: n,
-			num:  n.Start,
-		})
-	} else {
-		r.rc.lists = r.rc.lists[:len(r.rc.lists)-1]
+		r.rc.listMarker = n.Marker
 	}
 	return ast.WalkContinue
 }
 
 func (r *Renderer) renderListItem(node ast.Node, entering bool) ast.WalkStatus {
 	if entering {
-		var itemPrefix []byte
-		l := r.rc.lists[len(r.rc.lists)-1]
-
-		if l.list.IsOrdered() {
-			itemPrefix = append(itemPrefix, []byte(fmt.Sprint(l.num))...)
-			r.rc.lists[len(r.rc.lists)-1].num += 1
-		}
-		itemPrefix = append(itemPrefix, l.list.Marker, ' ')
+		itemPrefix := []byte{r.rc.listMarker, ' '}
 		// Prefix the current line with the item prefix
 		r.rc.writer.PushPrefix(itemPrefix, 0, 0)
 		// Prefix subsequent lines with padding the same length as the item prefix
@@ -292,7 +297,7 @@ func (r *Renderer) renderRawHTML(node ast.Node, entering bool) ast.WalkStatus {
 
 func (r *Renderer) renderText(node ast.Node, entering bool) ast.WalkStatus {
 	n := node.(*ast.Text)
-	if entering {
+	if !r.isInsideTable && entering {
 		text := n.Text(r.rc.source)
 
 		r.rc.writer.Write(text)
@@ -332,6 +337,7 @@ func (r *Renderer) renderImage(node ast.Node, entering bool) ast.WalkStatus {
 	if entering {
 		r.rc.writer.Write([]byte("!"))
 	}
+
 	return r.renderLinkCommon(n.Title, n.Destination, entering)
 }
 
@@ -367,17 +373,94 @@ func (r *Renderer) renderEmphasis(node ast.Node, entering bool) ast.WalkStatus {
 	return ast.WalkContinue
 }
 
+func (r *Renderer) renderTableEventually() {
+
+	r.rc.writer.Write([]byte{'\n'})
+	r.rc.writer.FlushLine()
+
+	for i := 0; i < len(r.columnSize); i++ {
+		r.rc.writer.Write([]byte("| "))
+		r.rc.writer.Write([]byte(r.tableHeaders[i]))
+		r.rc.writer.Write([]byte(strings.Repeat(" ", r.columnSize[i]-len(r.tableHeaders[i]))))
+		r.rc.writer.Write([]byte(" "))
+	}
+	r.rc.writer.Write([]byte("|"))
+	r.rc.writer.FlushLine()
+
+	for i := 0; i < len(r.columnSize); i++ {
+		r.rc.writer.Write([]byte("|-"))
+		r.rc.writer.Write([]byte(strings.Repeat("-", r.columnSize[i])))
+		r.rc.writer.Write([]byte("-"))
+	}
+	r.rc.writer.Write([]byte("|"))
+	r.rc.writer.FlushLine()
+
+	for j := 0; j < len(r.tableCells); j++ {
+		for i := 0; i < len(r.columnSize); i++ {
+			r.rc.writer.Write([]byte("| "))
+			r.rc.writer.Write([]byte(r.tableCells[j][i]))
+			r.rc.writer.Write([]byte(strings.Repeat(" ", r.columnSize[i]-len(r.tableCells[j][i]))))
+			r.rc.writer.Write([]byte(" "))
+		}
+		r.rc.writer.Write([]byte("|"))
+		r.rc.writer.FlushLine()
+	}
+}
+
+func (r *Renderer) renderTable(node ast.Node, entering bool) ast.WalkStatus {
+	r.isInsideTable = entering
+	if entering {
+		r.isHeaderDone = false
+		r.columnSize = []int{}
+		r.tableHeaders = []string{}
+		r.tableCells = [][]string{}
+	} else {
+		r.renderTableEventually()
+	}
+	return ast.WalkContinue
+}
+
+func (r *Renderer) renderTableHeader(node ast.Node, entering bool) ast.WalkStatus {
+	if entering {
+		r.isHeaderDone = false
+	}
+	return ast.WalkContinue
+}
+
+func (r *Renderer) renderTableRow(node ast.Node, entering bool) ast.WalkStatus {
+	if entering {
+		r.isHeaderDone = true
+		r.tableCells = append(r.tableCells, []string{})
+	}
+	return ast.WalkContinue
+}
+
+func (r *Renderer) renderTableCell(node ast.Node, entering bool) ast.WalkStatus {
+	if !entering {
+		n := node.(*exast.TableCell)
+
+		var text string = string(n.Text(r.rc.source))
+		if !r.isHeaderDone {
+			r.columnSize = append(r.columnSize, len(text))
+			r.tableHeaders = append(r.tableHeaders, text)
+		} else {
+			if len(text) > r.columnSize[len(r.tableCells[len(r.tableCells)-1])] {
+				r.columnSize[len(r.tableCells[len(r.tableCells)-1])] = len(text)
+			}
+			r.tableCells[len(r.tableCells)-1] = append(r.tableCells[len(r.tableCells)-1], string(n.Text(r.rc.source)))
+		}
+
+	}
+
+	return ast.WalkContinue
+}
+
 type renderContext struct {
 	writer *markdownWriter
 	// source is the markdown source
 	source []byte
-	// listMarkers is the marker character used for the current list
-	lists []listContext
-}
-
-type listContext struct {
-	list *ast.List
-	num  int
+	// listMarker is the marker character used for the current list
+	listMarker byte
 }
 
 // newRenderContext returns a new renderContext object
